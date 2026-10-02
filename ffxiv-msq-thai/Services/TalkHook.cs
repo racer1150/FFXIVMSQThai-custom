@@ -28,11 +28,28 @@ public sealed class TalkHook : IDisposable
         new(@"[\x02][\s\S]{1,4}[\x03]|[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]",
             RegexOptions.Compiled);
 
+    // ── Player-name placeholders ──────────────────────────────────────────
+    // ไฟล์คำแปลใช้ Forename / Surname เป็นตัวแทนชื่อผู้เล่น (บางที่ครอบด้วย [] {} <>)
+    // ต้องแทนกลับเป็นชื่อตัวละครจริงก่อนแสดงผล
+    // ใช้ lookaround แบบ Latin แทน \b เพราะอักษรไทยนับเป็น \w ทำให้ \b ไม่ทำงานเมื่อชื่ออยู่ติดตัวอักษรไทย
+    private static Regex PlaceholderRegex(string inner) => new(
+        $@"(?:\[\s*{inner}\s*\]|\{{\s*{inner}\s*\}}|<\s*{inner}\s*>|(?<![A-Za-z]){inner}(?![A-Za-z]))",
+        RegexOptions.Compiled);
+
+    private static readonly Regex PhFullName      = PlaceholderRegex(@"Forename\s+Surname");
+    private static readonly Regex PhFullNameRev   = PlaceholderRegex(@"Surname\s+Forename");
+    private static readonly Regex PhForename      = PlaceholderRegex("Forename");
+    private static readonly Regex PhSurname       = PlaceholderRegex("Surname");
+
     private readonly IAddonLifecycle    _addonLifecycle;
     private readonly DialogueDictionary _dictionary;
     private readonly IClientState       _clientState;
     private readonly IObjectTable       _objectTable;
     private readonly IPluginLog         _log = Plugin.Log;
+
+    // เก็บชื่อล่าสุดไว้ เผื่อบางจังหวะ (เช่น ระหว่างโหลดฉาก) LocalPlayer เป็น null
+    private string     _playerFirst   = string.Empty;
+    private string     _playerLast    = string.Empty;
 
     private string     _lastTextEn    = string.Empty;
     private string     _lastAddonName = string.Empty;
@@ -122,13 +139,16 @@ public sealed class TalkHook : IDisposable
 
         // ── Normalize key ─────────────────────────────────────────────────
         var displayEn = DialogueDictionary.NormalizeEnglishKey(textEn);
-        var fullName  = _objectTable.LocalPlayer?.Name.ToString() ?? string.Empty;
-        var firstName = !string.IsNullOrEmpty(fullName) ? fullName.Split(' ')[0] : string.Empty;
+        UpdatePlayerName();
 
-        if (!string.IsNullOrEmpty(fullName) && displayEn.Contains(fullName))
-            displayEn = displayEn.Replace(fullName, "Forename Surname");
-        else if (!string.IsNullOrEmpty(firstName) && displayEn.Contains(firstName))
-            displayEn = displayEn.Replace(firstName, "Forename");
+        if (_playerFirst.Length > 0)
+        {
+            var fullName = _playerLast.Length > 0 ? $"{_playerFirst} {_playerLast}" : _playerFirst;
+            displayEn = ReplaceName(displayEn, fullName,      "Forename Surname");
+            displayEn = ReplaceName(displayEn, _playerFirst,  "Forename");
+            if (_playerLast.Length > 0)
+                displayEn = ReplaceName(displayEn, _playerLast, "Surname");
+        }
 
         if (displayEn.Length == 0) { CurrentTokens = Array.Empty<string>(); return; }
 
@@ -160,10 +180,48 @@ public sealed class TalkHook : IDisposable
 
     private void ApplyTranslation(string rawThai)
     {
-        var clean = SanitizeThai(rawThai);
+        var clean = SanitizeThai(ReplacePlaceholders(rawThai, _playerFirst, _playerLast));
         CurrentTokens = string.IsNullOrWhiteSpace(clean)
             ? Array.Empty<string>()
             : ThaiWordSegmenter.Segment(clean);
+    }
+
+    private void UpdatePlayerName()
+    {
+        var name = _objectTable.LocalPlayer?.Name.ToString();
+        if (string.IsNullOrWhiteSpace(name)) return;
+
+        var parts = name.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
+        _playerFirst = parts[0];
+        _playerLast  = parts.Length > 1 ? parts[1] : string.Empty;
+    }
+
+    /// <summary>แทนที่ชื่อผู้เล่นในข้อความอังกฤษ (ฝั่งคีย์ค้นหา) โดยไม่ไปกัดกลางคำอื่น เช่น ชื่อ "Al" ใน "Alisaie"</summary>
+    private static string ReplaceName(string text, string name, string placeholder)
+    {
+        if (string.IsNullOrEmpty(name)) return text;
+        return Regex.Replace(
+            text,
+            $@"(?<![A-Za-z]){Regex.Escape(name)}(?![A-Za-z])",
+            _ => placeholder);
+    }
+
+    /// <summary>
+    /// แทน Forename / Surname (และรูปแบบ [Forename] {Forename} &lt;Forename&gt; Forename Surname)
+    /// ในคำแปลไทยด้วยชื่อตัวละครจริง ถ้ายังไม่รู้ชื่อจะคืนข้อความเดิม
+    /// </summary>
+    internal static string ReplacePlaceholders(string text, string first, string last)
+    {
+        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(first)) return text;
+
+        var full = string.IsNullOrEmpty(last) ? first : $"{first} {last}";
+
+        // ลำดับสำคัญ: รูปแบบยาวก่อนรูปแบบสั้น
+        text = PhFullName.Replace(text,    _ => full);
+        text = PhFullNameRev.Replace(text, _ => string.IsNullOrEmpty(last) ? first : $"{last} {first}");
+        text = PhForename.Replace(text,    _ => first);
+        text = PhSurname.Replace(text,     _ => string.IsNullOrEmpty(last) ? first : last);
+        return text;
     }
 
     private static string Clip(string s) => s.Length > 40 ? s[..40] + "…" : s;
